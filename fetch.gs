@@ -153,13 +153,27 @@ function runConfiguredFetchV2() {
       existingUrlSet.add(gameUrl);
     }
     if (rows.length) {
+      var start = gamesSheet.getLastRow() + 1;
       appendRowsV2_(gamesSheet, rows, selectedHeaders.length);
+      var end = start + rows.length - 1;
+      if (cfg.groups && cfg.groups.callback && cfg.groups.callback.calculateNew) {
+        populateCallbackForRange_(headersSheet, gamesSheet, start, end);
+      }
     }
   }
 
   // Recalculate derived across sheet if requested
   if (cfg.groups && cfg.groups.derived && cfg.groups.derived.recalculate) {
     recalcDerivedV2_(headersSheet, gamesSheet, selectedHeaders);
+  }
+
+  // If Callback group is toggled to recalculate, run over all rows
+  if (cfg.groups && cfg.groups.callback && cfg.groups.callback.recalculate) {
+    // Entire data range
+    var lastRowCb = gamesSheet.getLastRow();
+    if (lastRowCb >= 2) {
+      populateCallbackForRange_(headersSheet, gamesSheet, 2, lastRowCb);
+    }
   }
 }
 

@@ -65,7 +65,8 @@ function setupConfig() {
 
   var groups = [
     ['Archive API', true, false],
-    ['Derived', true, false]
+    ['Derived', true, false],
+    ['Callback', true, false]
   ];
   sheet.getRange(tableStartRow + 2, 1, groups.length, 3).setValues(groups);
 
@@ -79,7 +80,7 @@ function setupConfig() {
  * @return {{ username: string,
  *            writeMode: 'append'|'clear',
  *            selection: { type: 'all'|'count'|'range', count?: number, direction?: 'newest'|'oldest', start?: string, end?: string },
- *            groups: { archiveApi: { calculateNew: boolean, recalculate: boolean }, derived: { calculateNew: boolean, recalculate: boolean } } }}
+ *            groups: { archiveApi: { calculateNew: boolean, recalculate: boolean }, derived: { calculateNew: boolean, recalculate: boolean }, callback: { calculateNew: boolean, recalculate: boolean } } }}
  */
 function readConfig_() {
   var ss = SpreadsheetApp.getActive();
@@ -122,7 +123,7 @@ function readConfig_() {
   if (headerRow === -1) throw new Error('Data Groups header not found in Config. Run setupConfig() again.');
 
   // Read table rows until blank Data Group name
-  var groups = { archiveApi: { calculateNew: true, recalculate: false }, derived: { calculateNew: true, recalculate: false } };
+  var groups = { archiveApi: { calculateNew: true, recalculate: false }, derived: { calculateNew: true, recalculate: false }, callback: { calculateNew: true, recalculate: false } };
   for (var tr = headerRow + 1; tr <= lastRow; tr++) {
     var name = String(sheet.getRange(tr, 1).getValue() || '').trim();
     if (!name) break;
@@ -130,6 +131,7 @@ function readConfig_() {
     var recal = !!sheet.getRange(tr, 3).getValue();
     if (/^archive api$/i.test(name)) groups.archiveApi = { calculateNew: calc, recalculate: recal };
     if (/^derived$/i.test(name)) groups.derived = { calculateNew: calc, recalculate: recal };
+    if (/^callback$/i.test(name)) groups.callback = { calculateNew: calc, recalculate: recal };
   }
 
   return {
@@ -165,6 +167,83 @@ function monthFromArchiveUrl_(url) {
   var m = String(url || '').match(/\/(\d{4})\/(\d{2})\s*$/);
   if (!m) return '';
   return m[1] + '-' + m[2];
+}
+
+/**
+ * Extracts a Chess.com live game ID from a game URL.
+ * Supports urls like:
+ * - https://www.chess.com/game/live/142266290868
+ * - https://www.chess.com/live/game/142266290868
+ * - https://www.chess.com/game/computer/142266290868 (ignored)
+ * @param {string} url
+ * @return {string}
+ */
+function extractCallbackIdFromUrl_(url) {
+  var s = String(url || '');
+  // Prefer explicit live paths
+  var m1 = s.match(/\/(?:game\/live|live\/game)\/(\d+)(?:\?|#|$)/i);
+  if (m1 && m1[1]) return m1[1];
+  // Fallback: ensure '/live/' exists somewhere and grab trailing numeric id
+  if (/\/live\//i.test(s)) {
+    var m2 = s.match(/\/(\d+)(?:\?|#|$)/);
+    if (m2 && m2[1]) return m2[1];
+  }
+  return '';
+}
+
+/**
+ * Fetches the Chess.com callback JSON for a given live game id.
+ * @param {string} gameId
+ * @return {Object|null}
+ */
+function fetchCallbackJsonById_(gameId) {
+  if (!gameId) return null;
+  var url = 'https://www.chess.com/callback/live/game/' + encodeURIComponent(String(gameId));
+  try {
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) return null;
+    var text = resp.getContentText();
+    try { return JSON.parse(text); } catch (e) { return null; }
+  } catch (e2) {
+    return null;
+  }
+}
+
+/**
+ * Fetches the callback JSON using a game URL, extracting the id first.
+ * @param {string} gameUrl
+ * @return {Object|null}
+ */
+function fetchCallbackJsonByUrl_(gameUrl) {
+  var id = extractCallbackIdFromUrl_(gameUrl);
+  return fetchCallbackJsonById_(id);
+}
+
+/**
+ * Flattens an object into dot-paths with primitive leaf values.
+ * @param {Object} obj
+ * @param {string=} prefix
+ * @param {Object<string,*>} out
+ */
+function flattenObjectPaths_(obj, prefix, out) {
+  if (!out) out = {};
+  var p = String(prefix || '').trim();
+  if (obj == null) return out;
+  if (typeof obj !== 'object') {
+    if (p) out[p] = obj;
+    return out;
+  }
+  for (var k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    var v = obj[k];
+    var path = p ? (p + '.' + k) : k;
+    if (v != null && typeof v === 'object') {
+      flattenObjectPaths_(v, path, out);
+    } else {
+      out[path] = v;
+    }
+  }
+  return out;
 }
 
 /**
