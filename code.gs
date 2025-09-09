@@ -22,6 +22,8 @@ function onOpen() {
     .addSeparator()
     .addItem('Setup Config sheet', 'setupConfig')
     .addItem('Run configured fetch', 'runConfiguredFetchV2')
+    .addSeparator()
+    .addItem('Batch process callback data', 'showCallbackBatchDialog')
     .addToUi();
 }
 
@@ -370,6 +372,18 @@ function buildHeaderCatalog_() {
       displayName: def.displayName || key,
       description: def.description || '',
       example: def.example || ''
+    });
+  });
+
+  // Callback fields (fetched from Chess.com callback API)
+  var callbackFields = getCallbackFields_();
+  callbackFields.forEach(function(cbField) {
+    fields.push({
+      field: cbField.field,
+      source: 'callback',
+      displayName: cbField.field,
+      description: cbField.description || '',
+      example: cbField.example || ''
     });
   });
 
