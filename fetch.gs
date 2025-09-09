@@ -161,6 +161,11 @@ function runConfiguredFetchV2() {
   if (cfg.groups && cfg.groups.derived && cfg.groups.derived.recalculate) {
     recalcDerivedV2_(headersSheet, gamesSheet, selectedHeaders);
   }
+  
+  // Process callback data if requested
+  if (cfg.groups && cfg.groups.callback && (cfg.groups.callback.calculateNew || cfg.groups.callback.recalculate)) {
+    processCallbackDataV2_(headersSheet, gamesSheet, selectedHeaders, cfg.groups.callback);
+  }
 }
 
 // Back-compat: legacy menu handler name used in other files
@@ -248,4 +253,126 @@ function appendRowsV2_(gamesSheet, rows, width) {
   if (!rows || !rows.length) return;
   var start = gamesSheet.getLastRow() + 1;
   gamesSheet.getRange(start, 1, rows.length, width).setValues(rows);
+}
+
+/**
+ * Process callback data for games that have URLs
+ * @param {Sheet} headersSheet
+ * @param {Sheet} gamesSheet
+ * @param {Array} selectedHeaders
+ * @param {Object} callbackConfig - Config with calculateNew and recalculate flags
+ */
+function processCallbackDataV2_(headersSheet, gamesSheet, selectedHeaders, callbackConfig) {
+  // Find callback columns in current selection
+  var callbackIndices = [];
+  for (var i = 0; i < selectedHeaders.length; i++) {
+    if (selectedHeaders[i].source === 'callback') callbackIndices.push(i);
+  }
+  if (!callbackIndices.length) return;
+  
+  // Find the URL column (required)
+  var urlIndex = selectedHeaders.findIndex(function(h) { return h.source === 'json' && h.field === 'url'; });
+  if (urlIndex === -1) {
+    throw new Error('Callback data requires the "url" field to be enabled in Headers.');
+  }
+  
+  var lastRow = gamesSheet.getLastRow();
+  var lastCol = gamesSheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return;
+  
+  // Read all data
+  var values = gamesSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  
+  // Collect game IDs that need callback data
+  var gameIdsToFetch = [];
+  var rowIndexMap = {}; // gameId -> array of row indices
+  
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    var url = String(row[urlIndex] || '').trim();
+    if (!url) continue;
+    
+    var gameId = extractGameIdFromUrl_(url);
+    if (!gameId) continue;
+    
+    // Check if we need to fetch this game
+    var needsFetch = false;
+    if (callbackConfig.calculateNew) {
+      // Check if any callback columns are empty
+      for (var ci = 0; ci < callbackIndices.length; ci++) {
+        if (!row[callbackIndices[ci]]) {
+          needsFetch = true;
+          break;
+        }
+      }
+    }
+    if (callbackConfig.recalculate) {
+      needsFetch = true;
+    }
+    
+    if (needsFetch) {
+      if (!rowIndexMap[gameId]) {
+        rowIndexMap[gameId] = [];
+        gameIdsToFetch.push(gameId);
+      }
+      rowIndexMap[gameId].push(r);
+    }
+  }
+  
+  if (!gameIdsToFetch.length) return;
+  
+  // Show progress
+  var ui = SpreadsheetApp.getUi();
+  ui.showModalDialog(
+    HtmlService.createHtmlOutput('Fetching callback data for ' + gameIdsToFetch.length + ' games...')
+      .setWidth(300)
+      .setHeight(100),
+    'Processing Callback Data'
+  );
+  
+  // Batch fetch callback data
+  var callbackData = batchFetchCallbackData_(gameIdsToFetch, 5);
+  
+  // Update rows with callback data
+  var updatedCount = 0;
+  for (var gameId in rowIndexMap) {
+    var data = callbackData[gameId];
+    if (!data) continue;
+    
+    var rowIndices = rowIndexMap[gameId];
+    var callbackValues = processCallbackData_(data, gameId, selectedHeaders);
+    
+    for (var ri = 0; ri < rowIndices.length; ri++) {
+      var rowIdx = rowIndices[ri];
+      var row = values[rowIdx];
+      var changed = false;
+      
+      // Update only callback columns
+      for (var ci = 0; ci < selectedHeaders.length; ci++) {
+        if (selectedHeaders[ci].source === 'callback') {
+          var newVal = callbackValues[ci];
+          if (row[ci] !== newVal) {
+            row[ci] = newVal;
+            changed = true;
+          }
+        }
+      }
+      
+      if (changed) {
+        values[rowIdx] = row;
+        updatedCount++;
+      }
+    }
+  }
+  
+  // Write back all values
+  if (updatedCount > 0) {
+    gamesSheet.getRange(2, 1, values.length, lastCol).setValues(values);
+  }
+  
+  // Close progress dialog
+  ui.alert('Callback Data Complete', 
+    'Processed ' + gameIdsToFetch.length + ' games.\n' +
+    'Updated ' + updatedCount + ' rows.', 
+    ui.ButtonSet.OK);
 }
