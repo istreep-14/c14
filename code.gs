@@ -22,6 +22,10 @@ function onOpen() {
     .addSeparator()
     .addItem('Setup Config sheet', 'setupConfig')
     .addItem('Run configured fetch', 'runConfiguredFetchV2')
+    .addSeparator()
+    .addItem('Discover Callback headers (from selection)', 'discoverCallbackHeadersFromSelection')
+    .addItem('Run Callback for selection', 'runCallbackForSelection')
+    .addItem('Run Callback for URLs…', 'runCallbackForUrlsPrompt')
     .addToUi();
 }
 
@@ -57,6 +61,96 @@ function setupVersion2() {
 
 
 
+
+/**
+ * Discovers callback headers from selected Games rows by fetching callback JSON
+ * for each URL and flattening keys. Adds missing header rows for 'callback.*'.
+ */
+function discoverCallbackHeadersFromSelection() {
+  var ss = SpreadsheetApp.getActive();
+  var headersSheet = getOrCreateSheet_(SHEET_HEADERS_NAME);
+  var gamesSheet = getOrCreateSheet_(SHEET_GAMES_NAME);
+  var sel = ss.getActiveRange();
+  if (!sel || sel.getNumRows() < 1) { SpreadsheetApp.getUi().alert('Select at least one row in Games to discover.'); return; }
+
+  // Determine which column is the JSON url field in current header selection
+  var selectedHeaders = readSelectedHeaders_(headersSheet);
+  var urlColIdx = selectedHeaders.findIndex(function(h) { return h.source === 'json' && h.field === 'url'; });
+  if (urlColIdx === -1) { SpreadsheetApp.getUi().alert('The url field must be enabled in Headers to discover callback headers.'); return; }
+
+  var firstDataRow = 2;
+  var startRow = sel.getRow();
+  var endRow = startRow + sel.getNumRows() - 1;
+  var lastRow = gamesSheet.getLastRow();
+  var lastCol = gamesSheet.getLastColumn();
+  if (lastRow < firstDataRow) { SpreadsheetApp.getUi().alert('No data rows.'); return; }
+  var r1 = Math.max(firstDataRow, startRow);
+  var r2 = Math.min(lastRow, endRow);
+  if (r2 < r1) { SpreadsheetApp.getUi().alert('Selection does not include data rows.'); return; }
+
+  var values = gamesSheet.getRange(r1, 1, r2 - r1 + 1, lastCol).getValues();
+  var keySet = new Set();
+
+  for (var i = 0; i < values.length; i++) {
+    var row = values[i];
+    var gameUrl = String(row[urlColIdx] || '').trim();
+    if (!gameUrl) continue;
+    var cb = fetchCallbackJsonByUrl_(gameUrl);
+    if (!cb) continue;
+    var flat = flattenObjectPaths_(cb, '', {});
+    for (var k in flat) { if (Object.prototype.hasOwnProperty.call(flat, k)) keySet.add('callback.' + k); }
+  }
+
+  if (!keySet.size) { SpreadsheetApp.getUi().alert('No callback keys discovered.'); return; }
+
+  // Read existing header rows to avoid duplicates
+  var lastHeaderRow = headersSheet.getLastRow();
+  var headerValues = lastHeaderRow >= 2 ? headersSheet.getRange(2, 1, lastHeaderRow - 1, 8).getValues() : [];
+  var existing = new Set();
+  for (var j = 0; j < headerValues.length; j++) {
+    var rowF = String(headerValues[j][2] || '').trim();
+    var rowS = String(headerValues[j][3] || '').trim();
+    if (rowS === 'callback' && rowF) existing.add(rowF);
+  }
+
+  var toAdd = [];
+  keySet.forEach(function(k){ if (!existing.has(k)) toAdd.push(k); });
+  if (!toAdd.length) { SpreadsheetApp.getUi().alert('All discovered callback fields already exist.'); return; }
+
+  var rowsToAppend = toAdd.map(function(k){ return [true, '', k, 'callback', k.replace(/^callback\./, 'Callback: '), '', '', '']; });
+  var insertAt = headersSheet.getLastRow() + 1;
+  headersSheet.getRange(insertAt, 1, rowsToAppend.length, 8).setValues(rowsToAppend);
+  headersSheet.getRange(insertAt, 1, rowsToAppend.length, 1).insertCheckboxes();
+}
+
+/**
+ * Runs callback population for currently selected Games rows.
+ */
+function runCallbackForSelection() {
+  var ss = SpreadsheetApp.getActive();
+  var headersSheet = getOrCreateSheet_(SHEET_HEADERS_NAME);
+  var gamesSheet = getOrCreateSheet_(SHEET_GAMES_NAME);
+  var sel = ss.getActiveRange();
+  if (!sel || sel.getNumRows() < 1) { SpreadsheetApp.getUi().alert('Select at least one row in Games.'); return; }
+  populateCallbackForRange_(headersSheet, gamesSheet, sel.getRow(), sel.getRow() + sel.getNumRows() - 1);
+}
+
+/**
+ * Prompts for newline-separated game URLs and runs callback population in batch.
+ */
+function runCallbackForUrlsPrompt() {
+  var ui = SpreadsheetApp.getUi();
+  var res = ui.prompt('Enter game URLs (one per line) to fetch callback JSON for:', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  var text = String(res.getResponseText() || '').trim();
+  if (!text) return;
+  var urls = text.split(/\r?\n/).map(function(s){ return String(s).trim(); }).filter(function(s){ return !!s; });
+  if (!urls.length) return;
+
+  var headersSheet = getOrCreateSheet_(SHEET_HEADERS_NAME);
+  var gamesSheet = getOrCreateSheet_(SHEET_GAMES_NAME);
+  populateCallbackForUrls_(headersSheet, gamesSheet, urls);
+}
 
 /**
  * Fetches monthly games for a user and writes selected fields to the Games sheet.
@@ -373,5 +467,94 @@ function buildHeaderCatalog_() {
     });
   });
 
+  // Callback fields (discovered dynamically). We seed a helper row so users know how to add.
+  fields.push({ field: 'callback.<path>', source: 'callback', displayName: 'Callback: <path>', description: 'Set Field to callback.<dot.path> and Source to callback', example: 'callback.game.id' });
+
   return fields;
 }
+
+/**
+ * Internal: populate callback fields for a Games row range [startRow..endRow].
+ * Reads enabled Headers with source='callback' and fills columns.
+ */
+function populateCallbackForRange_(headersSheet, gamesSheet, startRow, endRow) {
+  var selectedHeaders = readSelectedHeaders_(headersSheet);
+  var callbackCols = [];
+  for (var i = 0; i < selectedHeaders.length; i++) {
+    if (selectedHeaders[i].source === 'callback') callbackCols.push(i);
+  }
+  if (!callbackCols.length) { SpreadsheetApp.getUi().alert('No callback headers are enabled.'); return; }
+
+  var urlColIdx = selectedHeaders.findIndex(function(h) { return h.source === 'json' && h.field === 'url'; });
+  if (urlColIdx === -1) { SpreadsheetApp.getUi().alert('The url field must be enabled in Headers.'); return; }
+
+  var firstDataRow = 2;
+  var lastRow = gamesSheet.getLastRow();
+  var lastCol = gamesSheet.getLastColumn();
+  var r1 = Math.max(firstDataRow, startRow);
+  var r2 = Math.min(lastRow, endRow);
+  if (r2 < r1 || lastRow < firstDataRow) return;
+
+  var values = gamesSheet.getRange(r1, 1, r2 - r1 + 1, lastCol).getValues();
+
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    var gameUrl = String(row[urlColIdx] || '').trim();
+    if (!gameUrl) continue;
+    var cb = fetchCallbackJsonByUrl_(gameUrl);
+    if (!cb) continue;
+    for (var ci = 0; ci < callbackCols.length; ci++) {
+      var c = callbackCols[ci];
+      var fieldPath = String(selectedHeaders[c].field || '').replace(/^callback\.?/, '');
+      if (!fieldPath) { row[c] = ''; continue; }
+      var val = deepGet_(cb, fieldPath);
+      row[c] = val;
+    }
+    values[r] = row;
+  }
+
+  gamesSheet.getRange(r1, 1, values.length, lastCol).setValues(values);
+}
+
+/**
+ * Internal: populate callback fields for any rows whose URL matches provided urls.
+ */
+function populateCallbackForUrls_(headersSheet, gamesSheet, urls) {
+  var selectedHeaders = readSelectedHeaders_(headersSheet);
+  var callbackCols = [];
+  for (var i = 0; i < selectedHeaders.length; i++) {
+    if (selectedHeaders[i].source === 'callback') callbackCols.push(i);
+  }
+  if (!callbackCols.length) { SpreadsheetApp.getUi().alert('No callback headers are enabled.'); return; }
+
+  var urlColIdx = selectedHeaders.findIndex(function(h) { return h.source === 'json' && h.field === 'url'; });
+  if (urlColIdx === -1) { SpreadsheetApp.getUi().alert('The url field must be enabled in Headers.'); return; }
+
+  var set = new Set(urls.map(function(u){ return String(u).trim(); }));
+  var lastRow = gamesSheet.getLastRow();
+  var lastCol = gamesSheet.getLastColumn();
+  if (lastRow < 2) return;
+  var values = gamesSheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  // Pre-fetch callbacks per URL to avoid multiple fetches per row if duplicates
+  var urlToCb = {};
+  set.forEach(function(u){ var cb = fetchCallbackJsonByUrl_(u); if (cb) urlToCb[u] = cb; });
+
+  for (var r = 0; r < values.length; r++) {
+    var row = values[r];
+    var gameUrl = String(row[urlColIdx] || '').trim();
+    if (!set.has(gameUrl)) continue;
+    var cb = urlToCb[gameUrl] || fetchCallbackJsonByUrl_(gameUrl);
+    if (!cb) continue;
+    for (var ci = 0; ci < callbackCols.length; ci++) {
+      var c = callbackCols[ci];
+      var fieldPath = String(selectedHeaders[c].field || '').replace(/^callback\.?/, '');
+      var val = fieldPath ? deepGet_(cb, fieldPath) : '';
+      row[c] = val;
+    }
+    values[r] = row;
+  }
+
+  gamesSheet.getRange(2, 1, values.length, lastCol).setValues(values);
+}
+
